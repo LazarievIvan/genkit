@@ -21,12 +21,13 @@ import {
   runNewEvaluation,
   validateSchema,
 } from '../eval';
-import type { RuntimeManager } from '../manager/manager';
+import type { BaseRuntimeManager } from '../manager/manager';
 import { AppProcessStatus } from '../manager/process-manager';
 import { GenkitToolsError, type RuntimeInfo } from '../manager/types';
 import { TraceDataSchema } from '../types';
 import type { Action } from '../types/action';
 import * as apis from '../types/apis';
+import { CancelActionRequestSchema } from '../types/apis';
 import type { EnvironmentVariable } from '../types/env';
 import * as evals from '../types/eval';
 import type { PromptFrontmatter } from '../types/prompt';
@@ -124,7 +125,7 @@ const loggedProcedure = t.procedure.use(async (opts) => {
 });
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-export const TOOLS_SERVER_ROUTER = (manager: RuntimeManager) =>
+export const TOOLS_SERVER_ROUTER = (manager: BaseRuntimeManager) =>
   t.router({
     /** Retrieves all runnable actions. */
     listActions: loggedProcedure
@@ -133,11 +134,11 @@ export const TOOLS_SERVER_ROUTER = (manager: RuntimeManager) =>
         return manager.listActions(input);
       }),
 
-    /** Runs an action. */
-    runAction: loggedProcedure
-      .input(apis.RunActionRequestSchema)
-      .mutation(async ({ input }) => {
-        return manager.runAction(input);
+    /** Retrieves all values. */
+    listValues: loggedProcedure
+      .input(apis.ListValuesRequestSchema)
+      .query(async ({ input }): Promise<Record<string, unknown>> => {
+        return manager.listValues(input);
       }),
 
     /** Generate a .prompt file from messages and model config. */
@@ -148,6 +149,7 @@ export const TOOLS_SERVER_ROUTER = (manager: RuntimeManager) =>
           model: input.model.replace('/model/', ''),
           config: input.config,
           tools: input.tools?.map((toolDefinition) => toolDefinition.name),
+          use: input.use,
         };
         return fromMessages(frontmatter, input.messages);
       }),
@@ -157,6 +159,13 @@ export const TOOLS_SERVER_ROUTER = (manager: RuntimeManager) =>
       .input(apis.ListTracesRequestSchema)
       .query(async ({ input }) => {
         return manager.listTraces(input);
+      }),
+
+    /** Retrieves all logs. */
+    listLogs: loggedProcedure
+      .input(apis.ListLogsRequestSchema)
+      .query(async ({ input }) => {
+        return manager.listLogs(input);
       }),
 
     /** Retrieves a trace for a given ID. */
@@ -328,6 +337,13 @@ export const TOOLS_SERVER_ROUTER = (manager: RuntimeManager) =>
       await manager.processManager?.kill();
       return true;
     }),
+
+    /** Cancels a long-running action. */
+    cancelAction: loggedProcedure
+      .input(CancelActionRequestSchema)
+      .mutation(async ({ input }) => {
+        return manager.cancelAction(input);
+      }),
   });
 
 export type ToolsServerRouter = ReturnType<typeof TOOLS_SERVER_ROUTER>;

@@ -1,4 +1,6 @@
 /**
+ * @license
+ *
  * Copyright 2025 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,5 +16,24 @@
  * limitations under the License.
  */
 
+/**
+ * Beta features including interrupts, stream managers, and the experimental
+ * {@link GenkitBeta} class.
+ *
+ * ```ts
+ * import { genkit } from 'genkit/beta';
+ * ```
+ *
+ * @module beta
+ */
+
+export {
+  InMemoryStreamManager,
+  StreamNotFoundError,
+  type ActionStreamInput,
+  type ActionStreamSubscriber,
+  type StreamManager,
+} from '@genkit-ai/core';
+export { AsyncTaskQueue, lazy } from '@genkit-ai/core/async';
 export * from './common.js';
 export { GenkitBeta, genkit, type GenkitBetaOptions } from './genkit-beta.js';

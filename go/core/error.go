@@ -37,11 +37,12 @@ type ReflectionError struct {
 
 // GenkitError is the base error type for Genkit errors.
 type GenkitError struct {
-	Message  string         `json:"message"` // Exclude from default JSON if embedded elsewhere
-	Status   StatusName     `json:"status"`
-	HTTPCode int            `json:"-"`                // Exclude from default JSON
-	Details  map[string]any `json:"details"`          // Use map for arbitrary details
-	Source   *string        `json:"source,omitempty"` // Pointer for optional
+	Message       string         `json:"message"` // Exclude from default JSON if embedded elsewhere
+	Status        StatusName     `json:"status"`
+	HTTPCode      int            `json:"-"`                // Exclude from default JSON
+	Details       map[string]any `json:"details"`          // Use map for arbitrary details
+	Source        *string        `json:"source,omitempty"` // Pointer for optional
+	originalError error          // The wrapped error, if any
 }
 
 // UserFacingError is the base error type for user facing errors.
@@ -70,12 +71,19 @@ func (e *UserFacingError) Error() string {
 
 // NewError creates a new GenkitError with a stack trace.
 func NewError(status StatusName, message string, args ...any) *GenkitError {
-	// Prevents a compile-time warning about non-constant message.
 	msg := message
 
 	ge := &GenkitError{
 		Status:  status,
 		Message: fmt.Sprintf(msg, args...),
+	}
+
+	// scan args for the last error to wrap it (Iterate backwards)
+	for i := len(args) - 1; i >= 0; i-- {
+		if err, ok := args[i].(error); ok {
+			ge.originalError = err
+			break
+		}
 	}
 
 	errStack := string(debug.Stack())
@@ -91,14 +99,47 @@ func (e *GenkitError) Error() string {
 	return e.Message
 }
 
+// Unwrap implements the standard error unwrapping interface.
+// This allows errors.Is and errors.As to work with GenkitError.
+func (e *GenkitError) Unwrap() error {
+	return e.originalError
+}
+
+// SchemaValidationError is an error returned when action input fails parsing
+// or schema validation, e.g. when a model produces malformed tool arguments.
+type SchemaValidationError struct {
+	*GenkitError
+}
+
+// Unwrap returns the underlying GenkitError so that errors.Is and errors.As
+// continue to match *GenkitError anywhere a SchemaValidationError is returned.
+func (e *SchemaValidationError) Unwrap() error {
+	return e.GenkitError
+}
+
+// NewSchemaValidationError creates a SchemaValidationError for the given action key and validation error.
+func NewSchemaValidationError(actionKey string, err error) *SchemaValidationError {
+	return &SchemaValidationError{
+		GenkitError: NewError(INVALID_ARGUMENT, "invalid input to action %q: %v", actionKey, err),
+	}
+}
+
 // ToReflectionError returns a JSON-serializable representation for reflection API responses.
 func (e *GenkitError) ToReflectionError() ReflectionError {
-	errDetails := &ReflectionErrorDetails{}
-	if stackVal, ok := e.Details["stack"].(string); ok {
-		errDetails.Stack = &stackVal
-	}
-	if traceVal, ok := e.Details["traceId"].(string); ok {
-		errDetails.TraceID = &traceVal
+	var errDetails *ReflectionErrorDetails
+	if e.Details != nil {
+		stackVal, stackOk := e.Details["stack"].(string)
+		traceVal, traceOk := e.Details["traceId"].(string)
+
+		if stackOk || traceOk {
+			errDetails = &ReflectionErrorDetails{}
+			if stackOk {
+				errDetails.Stack = &stackVal
+			}
+			if traceOk {
+				errDetails.TraceID = &traceVal
+			}
+		}
 	}
 	return ReflectionError{
 		Details: errDetails,

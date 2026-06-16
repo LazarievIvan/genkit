@@ -18,34 +18,23 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/adler32"
-	"strconv"
 
+	"github.com/firebase/genkit/go/ai"
+	"github.com/firebase/genkit/go/internal/base"
+	pluginjsonschema "github.com/firebase/genkit/go/plugins/internal/jsonschema"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/shared"
-
-	"github.com/firebase/genkit/go/ai"
 )
-
-// mapToStruct unmarshals a map[string]any to the expected config api.
-func mapToStruct(m map[string]any, v any) error {
-	jsonData, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(jsonData, v)
-}
 
 // ModelGenerator handles OpenAI generation requests
 type ModelGenerator struct {
-	client       *openai.Client
-	modelName    string
-	request      *openai.ChatCompletionNewParams
-	messages     []openai.ChatCompletionMessageParamUnion
-	tools        []openai.ChatCompletionToolParam
-	toolChoice   openai.ChatCompletionToolChoiceOptionUnionParam
-	outputFormat openai.ChatCompletionNewParamsResponseFormatUnion
+	client     *openai.Client
+	modelName  string
+	request    *openai.ChatCompletionNewParams
+	messages   []openai.ChatCompletionMessageParamUnion
+	tools      []openai.ChatCompletionToolParam
+	toolChoice openai.ChatCompletionToolChoiceOptionUnionParam
 	// Store any errors that occur during building
 	err error
 }
@@ -60,7 +49,7 @@ func NewModelGenerator(client *openai.Client, modelName string) *ModelGenerator 
 		client:    client,
 		modelName: modelName,
 		request: &openai.ChatCompletionNewParams{
-			Model: modelName,
+			Model: (modelName),
 		},
 	}
 }
@@ -78,19 +67,20 @@ func (g *ModelGenerator) WithMessages(messages []*ai.Message) *ModelGenerator {
 
 	oaiMessages := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
 	for _, msg := range messages {
+		content := g.concatenateContent(msg.Content)
 		switch msg.Role {
 		case ai.RoleSystem:
-			oaiMessages = append(oaiMessages, openai.SystemMessage(concatenateTextParts(msg.Content)))
+			oaiMessages = append(oaiMessages, openai.SystemMessage(content))
 		case ai.RoleModel:
 			am := openai.ChatCompletionAssistantMessageParam{}
-			am.Content.OfString = param.NewOpt(concatenateTextParts(msg.Content))
+			am.Content.OfString = param.NewOpt(content)
 			toolCalls, err := convertToolCalls(msg.Content)
 			if err != nil {
 				g.err = err
 				return g
 			}
 			if len(toolCalls) > 0 {
-				am.ToolCalls = toolCalls
+				am.ToolCalls = (toolCalls)
 			}
 			oaiMessages = append(oaiMessages, openai.ChatCompletionMessageParamUnion{
 				OfAssistant: &am,
@@ -126,11 +116,15 @@ func (g *ModelGenerator) WithMessages(messages []*ai.Message) *ModelGenerator {
 							URL: p.Text,
 						})
 					parts = append(parts, part)
+					continue
 				}
 			}
-
 			if len(parts) > 0 {
-				oaiMessages = append(oaiMessages, openai.UserMessage(parts))
+				oaiMessages = append(oaiMessages, openai.ChatCompletionMessageParamUnion{
+					OfUser: &openai.ChatCompletionUserMessageParam{
+						Content: openai.ChatCompletionUserMessageParamContentUnion{OfArrayOfContentParts: parts},
+					},
+				})
 			}
 		default:
 			// ignore parts from not supported roles
@@ -162,7 +156,9 @@ func (g *ModelGenerator) WithConfig(config any) *ModelGenerator {
 	case *openai.ChatCompletionNewParams:
 		openaiConfig = *cfg
 	case map[string]any:
-		if err := mapToStruct(cfg, &openaiConfig); err != nil {
+		var err error
+		openaiConfig, err = base.MapToStruct[openai.ChatCompletionNewParams](cfg)
+		if err != nil {
 			g.err = fmt.Errorf("failed to convert config to openai.ChatCompletionNewParams: %w", err)
 			return g
 		}
@@ -193,13 +189,28 @@ func (g *ModelGenerator) WithTools(tools []*ai.ToolDefinition) *ModelGenerator {
 			continue
 		}
 
+		// Strict mode is opt-in. When enabled, recursively set
+		// additionalProperties: false on every object subschema; the caller
+		// is responsible for OpenAI's other strict requirements (e.g. every
+		// property must be listed in "required").
+		strict := false
+		if v, ok := tool.Metadata["strict"].(bool); ok {
+			strict = v
+		}
+		var params openai.FunctionParameters
+		if strict {
+			params = openai.FunctionParameters(pluginjsonschema.EnforceStrict(tool.InputSchema))
+		} else {
+			params = openai.FunctionParameters(tool.InputSchema)
+		}
+
 		toolParams = append(toolParams, openai.ChatCompletionToolParam{
-			Function: shared.FunctionDefinitionParam{
+			Function: (shared.FunctionDefinitionParam{
 				Name:        tool.Name,
 				Description: openai.String(tool.Description),
-				Parameters:  tool.InputSchema,
-				Strict:      openai.Bool(false), // TODO: implement strict mode
-			},
+				Parameters:  params,
+				Strict:      openai.Bool(strict),
+			}),
 		})
 	}
 
@@ -209,45 +220,6 @@ func (g *ModelGenerator) WithTools(tools []*ai.ToolDefinition) *ModelGenerator {
 	// which is not supported by some vendor APIs
 	if len(toolParams) > 0 {
 		g.tools = toolParams
-	}
-
-	return g
-}
-
-func schemaHash(schema map[string]any) string {
-	if schema == nil {
-		return ""
-	}
-
-	jsonBytes, err := json.Marshal(schema)
-	if err != nil {
-		return "" // should never happen
-	}
-
-	return strconv.FormatInt(int64(adler32.Checksum(jsonBytes)), 10) // adler32 entropy should be sufficient
-}
-
-func (g *ModelGenerator) WithOutput(output *ai.ModelOutputConfig) *ModelGenerator {
-	if g.err != nil {
-		return g
-	}
-
-	if output == nil {
-		return g
-	}
-
-	if !output.Constrained || output.Format != "json" && output.Schema == nil {
-		return g
-	}
-
-	g.outputFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
-		OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
-			JSONSchema: openai.ResponseFormatJSONSchemaJSONSchemaParam{
-				Name:   schemaHash(output.Schema),
-				Strict: openai.Bool(true),
-				Schema: output.Schema,
-			},
-		},
 	}
 
 	return g
@@ -269,7 +241,9 @@ func (g *ModelGenerator) Generate(ctx context.Context, req *ai.ModelRequest, han
 		g.request.Tools = g.tools
 	}
 
-	g.request.ResponseFormat = g.outputFormat
+	if req.Output != nil {
+		g.request.ResponseFormat = getResponseFormat(req.Output)
+	}
 
 	if handleChunk != nil {
 		return g.generateStream(ctx, handleChunk)
@@ -277,119 +251,87 @@ func (g *ModelGenerator) Generate(ctx context.Context, req *ai.ModelRequest, han
 	return g.generateComplete(ctx, req)
 }
 
+// getResponseFormat determines the appropriate response format based on the output configuration
+func getResponseFormat(output *ai.ModelOutputConfig) openai.ChatCompletionNewParamsResponseFormatUnion {
+	var format openai.ChatCompletionNewParamsResponseFormatUnion
+
+	if output == nil {
+		return format
+	}
+
+	switch output.Format {
+	case "json":
+		if output.Schema != nil {
+			jsonSchemaParam := shared.ResponseFormatJSONSchemaParam{
+				JSONSchema: shared.ResponseFormatJSONSchemaJSONSchemaParam{
+					Name:   "output",
+					Schema: output.Schema,
+					Strict: openai.Bool(true),
+				},
+			}
+			format.OfJSONSchema = &jsonSchemaParam
+		} else {
+			jsonObjectParam := shared.NewResponseFormatJSONObjectParam()
+			format.OfJSONObject = &jsonObjectParam
+		}
+	case "text":
+		textParam := shared.NewResponseFormatTextParam()
+		format.OfText = &textParam
+	}
+
+	return format
+}
+
+// concatenateContent concatenates text content into a single string
+func (g *ModelGenerator) concatenateContent(parts []*ai.Part) string {
+	content := ""
+	for _, part := range parts {
+		content += part.Text
+	}
+	return content
+}
+
 // generateStream generates a streaming model response
 func (g *ModelGenerator) generateStream(ctx context.Context, handleChunk func(context.Context, *ai.ModelResponseChunk) error) (*ai.ModelResponse, error) {
 	stream := g.client.Chat.Completions.NewStreaming(ctx, *g.request)
 	defer stream.Close()
 
-	var fullResponse ai.ModelResponse
-	fullResponse.Message = &ai.Message{
-		Role:    ai.RoleModel,
-		Content: make([]*ai.Part, 0),
-	}
-
-	// Initialize request and usage
-	fullResponse.Request = &ai.ModelRequest{}
-	fullResponse.Usage = &ai.GenerationUsage{
-		InputTokens:  0,
-		OutputTokens: 0,
-		TotalTokens:  0,
-	}
-
-	var currentToolCall *ai.ToolRequest
-	var currentArguments string
-	var toolCallCollects []struct {
-		toolCall *ai.ToolRequest
-		args     string
-	}
+	// Use openai-go's accumulator to collect the complete response
+	acc := &openai.ChatCompletionAccumulator{}
 
 	for stream.Next() {
 		chunk := stream.Current()
-		if len(chunk.Choices) > 0 {
-			choice := chunk.Choices[0]
-			modelChunk := &ai.ModelResponseChunk{}
+		acc.AddChunk(chunk)
 
-			switch choice.FinishReason {
-			case "tool_calls", "stop":
-				fullResponse.FinishReason = ai.FinishReasonStop
-			case "length":
-				fullResponse.FinishReason = ai.FinishReasonLength
-			case "content_filter":
-				fullResponse.FinishReason = ai.FinishReasonBlocked
-			case "function_call":
-				fullResponse.FinishReason = ai.FinishReasonOther
-			default:
-				fullResponse.FinishReason = ai.FinishReasonUnknown
-			}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
 
-			// handle tool calls
-			for _, toolCall := range choice.Delta.ToolCalls {
-				// first tool call (= current tool call is nil) contains the tool call name
-				if currentToolCall != nil && toolCall.ID != "" && currentToolCall.Ref != toolCall.ID {
-					toolCallCollects = append(toolCallCollects, struct {
-						toolCall *ai.ToolRequest
-						args     string
-					}{
-						toolCall: currentToolCall,
-						args:     currentArguments,
-					})
-					currentToolCall = nil
-					currentArguments = ""
-				}
+		// Create chunk for callback
+		modelChunk := &ai.ModelResponseChunk{}
 
-				if currentToolCall == nil {
-					currentToolCall = &ai.ToolRequest{
-						Name: toolCall.Function.Name,
-						Ref:  toolCall.ID,
-					}
-				}
+		// Handle content delta
+		if chunk.Choices[0].Delta.Content != "" {
+			modelChunk.Content = append(modelChunk.Content, ai.NewTextPart(chunk.Choices[0].Delta.Content))
+		}
 
-				if toolCall.Function.Arguments != "" {
-					currentArguments += toolCall.Function.Arguments
-				}
-
+		// Handle tool call deltas
+		for _, toolCall := range chunk.Choices[0].Delta.ToolCalls {
+			// Send the incremental tool call part in the chunk
+			if toolCall.Function.Name != "" || toolCall.Function.Arguments != "" {
 				modelChunk.Content = append(modelChunk.Content, ai.NewToolRequestPart(&ai.ToolRequest{
-					Name:  currentToolCall.Name,
+					Name:  toolCall.Function.Name,
 					Input: toolCall.Function.Arguments,
-					Ref:   currentToolCall.Ref,
+					Ref:   toolCall.ID,
 				}))
 			}
+		}
 
-			// when tool call is complete
-			if choice.FinishReason == "tool_calls" && currentToolCall != nil {
-				// parse accumulated arguments string
-				for _, toolcall := range toolCallCollects {
-					args, err := jsonStringToMap(toolcall.args)
-					if err != nil {
-						return nil, fmt.Errorf("could not parse tool args: %w", err)
-					}
-					toolcall.toolCall.Input = args
-					fullResponse.Message.Content = append(fullResponse.Message.Content, ai.NewToolRequestPart(toolcall.toolCall))
-				}
-				if currentArguments != "" {
-					args, err := jsonStringToMap(currentArguments)
-					if err != nil {
-						return nil, fmt.Errorf("could not parse tool args: %w", err)
-					}
-					currentToolCall.Input = args
-				}
-				fullResponse.Message.Content = append(fullResponse.Message.Content, ai.NewToolRequestPart(currentToolCall))
-			}
-
-			content := chunk.Choices[0].Delta.Content
-			// when starting a tool call, the content is empty
-			if content != "" {
-				modelChunk.Content = append(modelChunk.Content, ai.NewTextPart(content))
-				fullResponse.Message.Content = append(fullResponse.Message.Content, modelChunk.Content...)
-			}
-
+		// Call the chunk handler with incremental data
+		if len(modelChunk.Content) > 0 {
 			if err := handleChunk(ctx, modelChunk); err != nil {
 				return nil, fmt.Errorf("callback error: %w", err)
 			}
-
-			fullResponse.Usage.InputTokens += int(chunk.Usage.PromptTokens)
-			fullResponse.Usage.OutputTokens += int(chunk.Usage.CompletionTokens)
-			fullResponse.Usage.TotalTokens += int(chunk.Usage.TotalTokens)
 		}
 	}
 
@@ -397,30 +339,67 @@ func (g *ModelGenerator) generateStream(ctx context.Context, handleChunk func(co
 		return nil, fmt.Errorf("stream error: %w", err)
 	}
 
-	return &fullResponse, nil
+	// Convert accumulated ChatCompletion to ai.ModelResponse
+	return convertChatCompletionToModelResponse(&acc.ChatCompletion)
 }
 
-// generateComplete generates a complete model response
-func (g *ModelGenerator) generateComplete(ctx context.Context, req *ai.ModelRequest) (*ai.ModelResponse, error) {
-	completion, err := g.client.Chat.Completions.New(ctx, *g.request)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create completion: %w", err)
-	}
-
-	resp := &ai.ModelResponse{
-		Request: req,
-		Usage: &ai.GenerationUsage{
-			InputTokens:  int(completion.Usage.PromptTokens),
-			OutputTokens: int(completion.Usage.CompletionTokens),
-			TotalTokens:  int(completion.Usage.TotalTokens),
-		},
-		Message: &ai.Message{
-			Role: ai.RoleModel,
-		},
+// convertChatCompletionToModelResponse converts openai.ChatCompletion to ai.ModelResponse
+func convertChatCompletionToModelResponse(completion *openai.ChatCompletion) (*ai.ModelResponse, error) {
+	if len(completion.Choices) == 0 {
+		return nil, fmt.Errorf("no choices in completion")
 	}
 
 	choice := completion.Choices[0]
 
+	// Build usage information with detailed token breakdown
+	usage := &ai.GenerationUsage{
+		InputTokens:  int(completion.Usage.PromptTokens),
+		OutputTokens: int(completion.Usage.CompletionTokens),
+		TotalTokens:  int(completion.Usage.TotalTokens),
+	}
+
+	// Add reasoning tokens (thoughts tokens) if available
+	if completion.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
+		usage.ThoughtsTokens = int(completion.Usage.CompletionTokensDetails.ReasoningTokens)
+	}
+
+	// Add cached tokens if available
+	if completion.Usage.PromptTokensDetails.CachedTokens > 0 {
+		usage.CachedContentTokens = int(completion.Usage.PromptTokensDetails.CachedTokens)
+	}
+
+	// Add audio tokens to custom field if available
+	if completion.Usage.CompletionTokensDetails.AudioTokens > 0 {
+		if usage.Custom == nil {
+			usage.Custom = make(map[string]float64)
+		}
+		usage.Custom["audioTokens"] = float64(completion.Usage.CompletionTokensDetails.AudioTokens)
+	}
+
+	// Add prediction tokens to custom field if available
+	if completion.Usage.CompletionTokensDetails.AcceptedPredictionTokens > 0 {
+		if usage.Custom == nil {
+			usage.Custom = make(map[string]float64)
+		}
+		usage.Custom["acceptedPredictionTokens"] = float64(completion.Usage.CompletionTokensDetails.AcceptedPredictionTokens)
+	}
+	if completion.Usage.CompletionTokensDetails.RejectedPredictionTokens > 0 {
+		if usage.Custom == nil {
+			usage.Custom = make(map[string]float64)
+		}
+		usage.Custom["rejectedPredictionTokens"] = float64(completion.Usage.CompletionTokensDetails.RejectedPredictionTokens)
+	}
+
+	resp := &ai.ModelResponse{
+		Request: &ai.ModelRequest{},
+		Usage:   usage,
+		Message: &ai.Message{
+			Role:    ai.RoleModel,
+			Content: make([]*ai.Part, 0),
+		},
+	}
+
+	// Map finish reason
 	switch choice.FinishReason {
 	case "stop", "tool_calls":
 		resp.FinishReason = ai.FinishReasonStop
@@ -434,44 +413,58 @@ func (g *ModelGenerator) generateComplete(ctx context.Context, req *ai.ModelRequ
 		resp.FinishReason = ai.FinishReasonUnknown
 	}
 
-	// handle tool calls
-	var toolRequestParts []*ai.Part
+	// Set finish message if there's a refusal
+	if choice.Message.Refusal != "" {
+		resp.FinishMessage = choice.Message.Refusal
+		resp.FinishReason = ai.FinishReasonBlocked
+	}
+
+	// Add text content
+	if choice.Message.Content != "" {
+		resp.Message.Content = append(resp.Message.Content, ai.NewTextPart(choice.Message.Content))
+	}
+
+	// Add tool calls
 	for _, toolCall := range choice.Message.ToolCalls {
 		args, err := jsonStringToMap(toolCall.Function.Arguments)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("could not parse tool args: %w", err)
 		}
-		toolRequestParts = append(toolRequestParts, ai.NewToolRequestPart(&ai.ToolRequest{
+		resp.Message.Content = append(resp.Message.Content, ai.NewToolRequestPart(&ai.ToolRequest{
 			Ref:   toolCall.ID,
 			Name:  toolCall.Function.Name,
 			Input: args,
 		}))
 	}
 
-	// content and tool call may exist simultaneously
-	if completion.Choices[0].Message.Content != "" {
-		resp.Message.Content = append(resp.Message.Content, ai.NewTextPart(completion.Choices[0].Message.Content))
-	}
-
-	if len(toolRequestParts) > 0 {
-		resp.Message.Content = append(resp.Message.Content, toolRequestParts...)
-		return resp, nil
+	// Store additional metadata in custom field if needed
+	if completion.SystemFingerprint != "" {
+		resp.Custom = map[string]any{
+			"systemFingerprint": completion.SystemFingerprint,
+			"model":             completion.Model,
+			"id":                completion.ID,
+		}
 	}
 
 	return resp, nil
 }
 
-// concatenateTextParts concatenates text parts into a single string
-func concatenateTextParts(parts []*ai.Part) string {
-	text := ""
-	for _, part := range parts {
-		if part.Kind != ai.PartText {
-			continue
-		}
-
-		text += part.Text
+// generateComplete generates a complete model response
+func (g *ModelGenerator) generateComplete(ctx context.Context, req *ai.ModelRequest) (*ai.ModelResponse, error) {
+	completion, err := g.client.Chat.Completions.New(ctx, *g.request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create completion: %w", err)
 	}
-	return text
+
+	resp, err := convertChatCompletionToModelResponse(completion)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the original request
+	resp.Request = req
+
+	return resp, nil
 }
 
 func convertToolCalls(content []*ai.Part) ([]openai.ChatCompletionMessageToolCallParam, error) {
@@ -496,10 +489,10 @@ func convertToolCall(part *ai.Part) (*openai.ChatCompletionMessageToolCallParam,
 	}
 
 	param := &openai.ChatCompletionMessageToolCallParam{
-		ID: toolCallID,
-		Function: openai.ChatCompletionMessageToolCallFunctionParam{
-			Name: part.ToolRequest.Name,
-		},
+		ID: (toolCallID),
+		Function: (openai.ChatCompletionMessageToolCallFunctionParam{
+			Name: (part.ToolRequest.Name),
+		}),
 	}
 
 	args, err := anyToJSONString(part.ToolRequest.Input)
